@@ -23,16 +23,34 @@ class OfflineEnv:
             traffic_df: pd.DataFrame，包含该广告组在某投放周期内的所有曝光记录
                         必须包含列: adgroup_id, min_win_ecpm, p_ctr, p_cvr, real_ecpm, log_time
         """
-        self.df = traffic_df
+        # 预处理：一次性完成所有计算，按 adgroup_id 缓存 numpy 数组
+        df = traffic_df.copy()
+        df['min_win_ecpm'] = df['min_win_ecpm'] / 1000.0
+        df['real_ecpm'] = df['real_ecpm'] / 1000.0
+        df['pCTCVR'] = df['p_ctr'] * df['p_cvr']
 
-    def _logtime_to_timestep(self, log_time):
-        """
-        将 log_time（毫秒级时间戳）转换为时间步编号（1-72）。
-        假设一天24小时，每20分钟为一个步。
-        """
-        dt = pd.to_datetime(log_time, unit='ms')
-        minute_of_day = dt.hour * 60 + dt.minute
-        return minute_of_day // 20 + 1
+        # 向量化计算 timestep（避免逐行 apply）
+        dt = pd.to_datetime(df['log_time'], unit='ms')
+        df['timestep'] = (dt.dt.hour * 60 + dt.dt.minute) // 20 + 1
+
+        # 按 adgroup_id 预分组，每个 ad 再按 timestep 分组提取 numpy 数组
+        self._ad_cache = {}
+        for ad_id, ad_df in df.groupby('adgroup_id'):
+            ad_df = ad_df.sort_values('log_time')
+            step_groups = ad_df.groupby('timestep')
+            time_steps = sorted(step_groups.groups.keys())
+            step_arrays = {}
+            for ts in time_steps:
+                g = step_groups.get_group(ts)
+                step_arrays[ts] = {
+                    'pCTCVR': g['pCTCVR'].values,
+                    'min_win_ecpm': g['min_win_ecpm'].values,
+                    'real_ecpm': g['real_ecpm'].values,
+                }
+            self._ad_cache[ad_id] = {
+                'time_steps': time_steps,
+                'step_arrays': step_arrays,
+            }
 
     def reset(self, ad_id, period, initial_budget, cpacons):
         """
@@ -47,27 +65,14 @@ class OfflineEnv:
         返回:
             state: 16维初始状态向量（时间步1开始前的状态）
         """
-        # 筛选该广告组的数据
-        self.episode_df = self.df[self.df.adgroup_id == ad_id].copy()
-        self.episode_df.sort_values('log_time', inplace=True)
-        self.episode_df.reset_index(drop=True, inplace=True)
+        assert ad_id in self._ad_cache, f"广告组 {ad_id} 在环境数据中无曝光记录"
 
-        assert len(self.episode_df) > 0, f"广告组 {ad_id} 在环境数据中无曝光记录"
-
-        # ===== 关键修改：将 min_win_ecpm 和 real_ecpm 除以1000 =====
-        self.episode_df['min_win_ecpm'] = self.episode_df['min_win_ecpm'] / 1000.0
-        self.episode_df['real_ecpm'] = self.episode_df['real_ecpm'] / 1000.0
-
-        # 为每条曝光计算时间步编号（1-72）
-        self.episode_df['timestep'] = self.episode_df['log_time'].apply(self._logtime_to_timestep)
-
-        # 按时间步分组，得到每个时间步内的曝光记录
-        self.step_groups = self.episode_df.groupby('timestep')
-        # 获取有曝光的时间步列表（已排序）
-        self.time_steps = sorted(self.step_groups.groups.keys())
-        self.num_steps = len(self.time_steps)          # 实际有曝光的步数
-        self.current_idx = 0                            # 当前处理的时间步在列表中的索引
-        self.last_time_step = 0                          # 刚完成的时间步编号（0表示未开始）
+        cached = self._ad_cache[ad_id]
+        self.time_steps = cached['time_steps']
+        self.step_arrays = cached['step_arrays']
+        self.num_steps = len(self.time_steps)
+        self.current_idx = 0
+        self.last_time_step = 0
 
         self.initial_budget = initial_budget
         self.remaining_budget = self.initial_budget
@@ -76,23 +81,21 @@ class OfflineEnv:
         self.total_cost = 0.0
         self.total_conversion = 0.0
 
-        # ---------- 历史记录（用于实时计算16维状态）----------
-        # 每个元素是一个字典，包含该步的统计量
-        self.history = []          # 存储每一步的统计量，按时间顺序
+        # ---------- 历史记录（用于实时计算状态）----------
+        self.history = []
 
-        # 最近3步的滚动窗口（用于快速计算）
+        # 最近3步的滚动窗口
         self.last3_pacer = deque(maxlen=3)
         self.last3_ci_mean = deque(maxlen=3)
         self.last3_pvalue_mean = deque(maxlen=3)
         self.last3_conversion_per_pv = deque(maxlen=3)
         self.last3_win_prob = deque(maxlen=3)
         self.last3_pv_num = deque(maxlen=3)
-
         # 返回初始状态（时间步1开始前的状态）
         return self._get_initial_state()
 
     def _get_initial_state(self):
-        """返回初始状态：timeleft=1.0, bgtleft=1.0, 其余为0"""
+        """返回初始状态：timeleft=1.0, bgtleft=1.0, 其余为0（16维）"""
         return np.array([
             1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
@@ -118,53 +121,59 @@ class OfflineEnv:
                 "step_pv": 0
             }
 
-        # 获取当前时间步的曝光数据
+        # 获取当前时间步的预计算 numpy 数组
         current_timestep = self.time_steps[self.current_idx]
-        step_df = self.step_groups.get_group(current_timestep).copy()
+        arrays = self.step_arrays[current_timestep]
+        pCTCVR = arrays['pCTCVR']
+        min_win_ecpm = arrays['min_win_ecpm']
+        real_ecpm = arrays['real_ecpm']
+        n = len(pCTCVR)
 
-        # 初始化该步的统计量
+        # 向量化计算出价
+        bid_price = alpha * pCTCVR
+        bid_eligible = bid_price >= min_win_ecpm
+
+        # 预算约束循环（直接操作 numpy 数组，比 iterrows 快 ~1000x）
+        # 数据为1%采样，实际花费 = real_ecpm * 100；预算不足时有多少花多少
+        win_mask = np.zeros(n, dtype=np.bool_)
+        remaining = self.remaining_budget
+        processed_count = n
         step_cost = 0.0
         step_conversion = 0.0
-        step_win = 0
-        step_pv = 0
 
-        step_ci_sum = 0.0          # 用于计算平均 ci_mean
-        step_pvalue_sum = 0.0       # 用于计算平均 pvalue_mean
-        step_conversion_per_pv_sum = 0.0
-        step_win_sum = 0.0
-
-        for _, row in step_df.iterrows():
-            if self.remaining_budget <= 0:
+        for i in range(n):
+            if remaining <= 0:
+                processed_count = i
                 break
+            if bid_eligible[i]:
+                actual_cost = real_ecpm[i] * 100
+                if remaining >= actual_cost:
+                    # 预算充足：完整扣费，100条曝光的conversion
+                    win_mask[i] = True
+                    remaining -= actual_cost
+                    step_cost += actual_cost
+                    step_conversion += pCTCVR[i] * 100
+                else:
+                    # 预算不足：有多少花多少，conversion按比例折算
+                    ratio = remaining / actual_cost
+                    win_mask[i] = True
+                    step_cost += remaining
+                    step_conversion += pCTCVR[i] * ratio * 100
+                    remaining = 0.0
 
-            pCTCVR = row.p_ctr * row.p_cvr
-            bid_price = alpha * self.tcpa * pCTCVR
+        step_win = int(win_mask.sum())
+        step_pv = processed_count
 
-            win = (bid_price >= row.min_win_ecpm) and (self.remaining_budget >= row.real_ecpm)
+        self.remaining_budget = remaining
+        self.total_cost += step_cost
+        self.total_conversion += step_conversion
 
-            cost = row.real_ecpm if win else 0.0
-            conv = pCTCVR if win else 0.0
-
-            if win:
-                self.remaining_budget -= cost
-                self.total_cost += cost
-                self.total_conversion += conv
-
-            step_cost += cost
-            step_conversion += conv
-            step_win += 1 if win else 0
-            step_pv += 1
-
-            step_ci_sum += row.real_ecpm
-            step_pvalue_sum += pCTCVR
-            step_conversion_per_pv_sum += pCTCVR
-            step_win_sum += (1 if win else 0)
-
+        # 统计量（基于所有已处理的行，非仅 win）
         if step_pv > 0:
-            avg_ci_mean = step_ci_sum / step_pv
-            avg_pvalue_mean = step_pvalue_sum / step_pv
-            avg_conversion_per_pv = step_conversion_per_pv_sum / step_pv
-            avg_win_prob = step_win_sum / step_pv
+            avg_ci_mean = float(real_ecpm[:processed_count].mean())
+            avg_pvalue_mean = float(pCTCVR[:processed_count].mean())
+            avg_conversion_per_pv = avg_pvalue_mean
+            avg_win_prob = step_win / step_pv
         else:
             avg_ci_mean = 0.0
             avg_pvalue_mean = 0.0
@@ -188,7 +197,6 @@ class OfflineEnv:
         self.last3_conversion_per_pv.append(avg_conversion_per_pv)
         self.last3_win_prob.append(avg_win_prob)
         self.last3_pv_num.append(step_pv)
-
         self.current_idx += 1
         self.last_time_step = current_timestep
 

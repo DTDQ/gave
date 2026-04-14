@@ -1,8 +1,30 @@
 code/log
 code/saved_model
 code/.idea
+__pycache__/
+*.pyc
 code/*/__pycache__
 code/bidding_train_env/*/__pycache__
 code/bidding_train_env/*/*/__pycache__
-experiments
-data
+
+# Data (large files, not tracked)
+data/
+
+# Experiments: ignore large files, keep results
+experiments/*/data/
+experiments/*/models/
+experiments/**/train.csv
+experiments/**/val.csv
+experiments/**/*.pt
+
+# OS files
+.DS_Store
+
+# IDE
+.idea/
+
+# Huawei plugin (large binary)
+*.vsix
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

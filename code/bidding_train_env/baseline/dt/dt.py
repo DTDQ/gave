@@ -339,7 +339,8 @@ class GAVE(nn.Module):
         loss1 = torch.mean((1-wo_frozen)*((action_preds - action_target) ** 2) + wo_frozen*((action_preds - action_1_frozen) ** 2))
         loss2 = torch.mean((curr_score_preds - curr_score_target) ** 2)*2000
         loss3 = torch.mean(1-wo)*100
-        loss = loss1+loss2+loss3
+
+        loss = loss1 + loss2 + loss3
 
         # The loss in the paper. It's param sensitive and need careful param selection.
         # wo = torch.sigmoid(100 * (curr_score_preds_1 - curr_score_preds))
@@ -352,7 +353,7 @@ class GAVE(nn.Module):
         # loss3 = torch.mean(weight * (diff ** 2)) * 100
         # loss4 = torch.mean((curr_score_preds_1 - value_preds_frozen) ** 2) * 100
         # loss = loss1 + loss2 + loss3 + loss4
-        
+
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.parameters(), .25)

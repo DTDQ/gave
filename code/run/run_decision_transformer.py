@@ -65,7 +65,7 @@ def train_model(device="cpu", step_num=10000, state_dim=0, dir=None, save_step=5
     
     running_losses = [0.0] * 8
     print_interval = loss_report
-    
+
     # 训练开始
     logger.info("=" * 70)
     logger.info("Starting Training...")
@@ -73,11 +73,11 @@ def train_model(device="cpu", step_num=10000, state_dim=0, dir=None, save_step=5
     logger.info(f"Batch size: {batch_size}")
     logger.info(f"Loss report interval: {loss_report}")
     logger.info("=" * 70)
-    
+
     model.train()
-    for step_idx, (states, actions, rewards, dones, all_reward, 
+    for step_idx, (states, actions, rewards, dones, all_reward,
                    curr_score, timesteps, attention_mask, next_states) in enumerate(dataloader, 1):
-        
+
         # 移动到设备
         states = states.to(device)
         actions = actions.to(device)
@@ -90,33 +90,33 @@ def train_model(device="cpu", step_num=10000, state_dim=0, dir=None, save_step=5
         next_states = next_states.to(device)
 
         # 前向传播和损失计算
-        train_loss = model.step(states, actions, rewards, dones, all_reward, 
+        train_loss = model.step(states, actions, rewards, dones, all_reward,
                                curr_score, timesteps, attention_mask, next_states)
-        
+
         # 更新运行损失
         for i in range(len(train_loss)):
             running_losses[i] += train_loss[i]
-        
+
         # ========== 标准 Loss 打印 ==========
         if step_idx % print_interval == 0 or step_idx == 1 or step_idx == total_steps:
             # 计算平均损失
             steps_for_avg = print_interval if step_idx % print_interval == 0 else step_idx
             avg_losses = [loss / steps_for_avg for loss in running_losses]
-            
+
             # 构建完整的日志消息
             if step_idx == 1:
                 log_msg = f"[Step {step_idx:6d}/{total_steps}] Initial Loss: {avg_losses[0]:.6f} "
             else:
                 log_msg = f"[Step {step_idx:6d}/{total_steps}] Loss: {avg_losses[0]:.6f} "
-            
+
             log_msg += f"(L1: {avg_losses[1]:.6f}, L2: {avg_losses[2]:.6f}, L3: {avg_losses[3]:.6f})"
             logger.info(log_msg)
-            
+
             # 每隔一定周期显示详细指标
             if step_idx == 1 or step_idx == total_steps or (step_idx // print_interval) % 5 == 0:
                 logger.info(f"  Metrics - W: {avg_losses[4]:.6f}, Target: {avg_losses[5]:.6f}, "
                           f"Pred: {avg_losses[6]:.6f}, Pred1: {avg_losses[7]:.6f}")
-            
+
             # 重置运行损失
             running_losses = [0.0] * 8
         

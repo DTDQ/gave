@@ -1,0 +1,19 @@
+name: gave_env
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - tqdm
+  - pytorch::pytorch=2.1.2
+  - pytorch::torchvision=0.16.2
+  - pytorch::torchaudio=2.1.2
+  - nvidia::pytorch-cuda=12.1
+  - pip:
+    - gin-config
+    - psutil

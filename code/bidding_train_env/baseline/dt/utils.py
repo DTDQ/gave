@@ -1,119 +1,185 @@
 import torch
 from torch.utils.data import Dataset
 import pandas as pd
-import ast
 import numpy as np
-import pickle
-import random
+import warnings
+import os
 
 
 def getScore(budget, cpa_cons, states, all_reward):
     beta = 2
-    curr_cost = budget * (1 - states[:, 1]).reshape(-1,1)
-    curr_all_reward = all_reward.reshape(-1,1)
+    curr_cost = budget * (1 - states[:, 1]).reshape(-1, 1)
+    curr_all_reward = all_reward.reshape(-1, 1)
     curr_cpa = curr_cost / (curr_all_reward + 1e-10)
     curr_coef = cpa_cons / (curr_cpa + 1e-10)
     curr_penalty = pow(curr_coef, beta)
     curr_penalty = np.where(curr_penalty > 1.0, 1.0, curr_coef)
     curr_score = curr_penalty * curr_all_reward
-
     return curr_score
 
+
 class EpisodeReplayBuffer(Dataset):
+    """
+    训练数据缓冲区，直接从 CSV 加载，使用向量化解析 state/next_state。
+    """
     def __init__(self, device, state_dim, act_dim, data_path, scale=2000, K=20, if_test=False):
         self.device = device
         super(EpisodeReplayBuffer, self).__init__()
         self.scale = scale
-
         self.state_dim = state_dim
         self.act_dim = act_dim
-        training_data = pd.read_csv(data_path)
 
-        def safe_literal_eval(val):
-            if pd.isna(val):
-                return val
-            try:
-                return ast.literal_eval(val)
-            except (ValueError, SyntaxError):
-                print(ValueError)
-                return val
+        # 读取 CSV（指定 dtype 加速）
+        dtype = {
+            'deliveryPeriodIndex': int,
+            'advertiserNumber': int,
+            'budget': float,
+            'CPAConstraint': float,
+            'timeStepIndex': int,
+            'state': str,
+            'action': float,
+            'reward': float,
+            'done': int,
+            'next_state': str,
+        }
+        df = pd.read_csv(data_path, dtype=dtype)
 
-        training_data["state"] = training_data["state"].apply(safe_literal_eval)
-        training_data["next_state"] = training_data["next_state"].apply(safe_literal_eval)
-        self.trajectories = training_data
+        # ========== 向量化解析 state ==========
+        # 去除括号，按逗号分割，转换为 float
+        state_series = df['state'].str.strip('()')
+        state_split = state_series.str.split(',', expand=True).astype(float)
+        states_np = state_split.values  # shape: (n_rows, state_dim)
 
-        (self.period, self.adid, self.states, self.rewards, self.actions, self.returns, self.traj_lens, self.dones,
-         self.next_states, self.budget, self.cpacons) = [], [], [], [], [], [], [], [], [], [], []
-        state = []
-        reward = []
-        action = []
-        dones = []
-        next_state = []
-        budget = []
-        cpacons = []
-        period = []
-        adid = []
-        for index, row in self.trajectories.iterrows():
-            period.append(row['deliveryPeriodIndex'])
-            adid.append(row['advertiserNumber'])
-            state.append(row["state"])
-            reward.append(row['reward'])
-            action.append(row["action"])
-            dones.append(row["done"])
-            next_state.append(row["next_state"])
-            budget.append(row["budget"])
-            cpacons.append(row["CPAConstraint"])
-            if row["done"]:
-                if len(state) != 1:
-                    self.period.append(period[0])
-                    self.adid.append(adid[0])
-                    self.states.append(np.array(state))
-                    self.rewards.append(np.expand_dims(np.array(reward), axis=1))
-                    self.actions.append(np.expand_dims(np.array(action), axis=1))
-                    self.returns.append(sum(reward))
-                    self.traj_lens.append(len(state))
-                    self.dones.append(np.array(dones))
-                    if next_state[-1] is None:          # 新增条件判断
-                        next_state[-1] = next_state[-2] # 仅当 None 时替换
-                    self.next_states.append(np.array(next_state))
-                    self.budget.append(np.expand_dims(np.array(budget), axis=1))
-                    self.cpacons.append(np.expand_dims(np.array(cpacons), axis=1))
-                period = []
-                adid = []
-                state = []
-                reward = []
-                action = []
-                dones = []
-                next_state = []
-                budget = []
-                cpacons = []
-        self.traj_lens, self.returns = np.array(self.traj_lens), np.array(self.returns)
+        # ========== 向量化解析 next_state ==========
+        # 先创建全零矩阵
+        next_states_np = np.zeros((len(df), state_dim), dtype=np.float32)
+        # 筛选出非空且有效的 next_state
+        valid_mask = df['next_state'].notna() & (df['next_state'] != 'None') & (df['next_state'] != '')
+        if valid_mask.any():
+            valid_series = df.loc[valid_mask, 'next_state'].str.strip('()')
+            valid_split = valid_series.str.split(',', expand=True).astype(float)
+            next_states_np[valid_mask] = valid_split.values
 
+        # 提取其他列
+        periods = df['deliveryPeriodIndex'].values
+        adids = df['advertiserNumber'].values
+        actions = df['action'].values.astype(np.float32)
+        rewards = df['reward'].values.astype(np.float32)
+        dones = df['done'].values.astype(np.float32)
+        budgets = df['budget'].values.astype(np.float32)
+        cpacons = df['CPAConstraint'].values.astype(np.float32)
+        timesteps = df['timeStepIndex'].values.astype(np.int32)
+
+        # ========== 按 done 切分轨迹 ==========
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.dones = []
+        self.next_states = []
+        self.budgets = []
+        self.cpacons = []
+        self.periods = []
+        self.adids = []
+        self.timesteps = []
+
+        current_state = []
+        current_action = []
+        current_reward = []
+        current_done = []
+        current_next = []
+        current_budget = []
+        current_cpacon = []
+        current_period = []
+        current_adid = []
+        current_timestep = []
+
+        for i in range(len(df)):
+            current_state.append(states_np[i])
+            current_action.append(actions[i])
+            current_reward.append(rewards[i])
+            current_done.append(dones[i])
+            current_next.append(next_states_np[i])
+            current_budget.append(budgets[i])
+            current_cpacon.append(cpacons[i])
+            current_period.append(periods[i])
+            current_adid.append(adids[i])
+            current_timestep.append(timesteps[i])
+
+            # 遇到 done 或最后一行时结束轨迹
+            if dones[i] == 1 or i == len(df) - 1:
+                if len(current_state) > 1:  # 至少 2 步
+                    # 处理最后一个 next_state 可能为全零（原为 None）的情况
+                    if np.all(current_next[-1] == 0) and len(current_next) >= 2:
+                        current_next[-1] = current_next[-2].copy()
+
+                    self.states.append(np.array(current_state))
+                    self.actions.append(np.expand_dims(np.array(current_action), axis=1))
+                    self.rewards.append(np.expand_dims(np.array(current_reward), axis=1))
+                    self.dones.append(np.array(current_done))
+                    self.next_states.append(np.array(current_next))
+                    self.budgets.append(np.expand_dims(np.array(current_budget), axis=1))
+                    self.cpacons.append(np.expand_dims(np.array(current_cpacon), axis=1))
+                    self.periods.append(current_period[0])
+                    self.adids.append(current_adid[0])
+
+                # 重置
+                current_state = []
+                current_action = []
+                current_reward = []
+                current_done = []
+                current_next = []
+                current_budget = []
+                current_cpacon = []
+                current_period = []
+                current_adid = []
+                current_timestep = []
+
+        self.traj_lens = np.array([len(s) for s in self.states])
+        self.returns = np.array([np.sum(r) for r in self.rewards])
+
+        # 计算归一化参数
         tmp_states = np.concatenate(self.states, axis=0)
-        self.state_mean, self.state_std = np.mean(tmp_states, axis=0), np.std(tmp_states, axis=0) + 1e-6
+        self.state_mean = np.mean(tmp_states, axis=0)
+        self.state_std = np.std(tmp_states, axis=0) + 1e-6
 
+        # 构建 trajectories 列表（包含 all_reward, curr_score 等）
         self.trajectories = []
         for i in range(len(self.states)):
             all_reward = np.zeros(1 + len(self.rewards[i]))
             all_reward[0] = 0
             for ind in range(1, len(all_reward)):
                 all_reward[ind] = all_reward[ind - 1] + self.rewards[i][ind - 1]
-            s_rtg = np.concatenate((self.states[i], self.next_states[i][-1].reshape((1,-1))),axis=0)
-            curr_score = getScore(self.budget[i][0], self.cpacons[i][0], s_rtg, all_reward)
-            # curr_score[t] equals final_score - score_if_stop_at_t, which means it would get how manny scores from step t to the end.
-            curr_score = curr_score[-1]-curr_score
-            self.trajectories.append(
-                {"observations": self.states[i], "actions": self.actions[i], "rewards": self.rewards[i],
-                 "dones": self.dones[i], "next_states": self.next_states[i], "budget": self.budget[i],
-                 "cpacons": self.cpacons[i], "all_reward": all_reward, "curr_score": curr_score,
-                 "final_score": curr_score[0], "ad_id": self.adid[i], "period": self.period[i]})
+
+            # s_rtg 包含 states 和最后一个 next_state
+            s_rtg = np.concatenate(
+                (self.states[i], self.next_states[i][-1].reshape((1, -1))),
+                axis=0
+            )
+            curr_score = getScore(self.budgets[i][0], self.cpacons[i][0], s_rtg, all_reward)
+            curr_score = curr_score[-1] - curr_score
+
+            self.trajectories.append({
+                "observations": self.states[i],
+                "actions": self.actions[i],
+                "rewards": self.rewards[i],
+                "dones": self.dones[i],
+                "next_states": self.next_states[i],
+                "budget": self.budgets[i],
+                "cpacons": self.cpacons[i],
+                "all_reward": all_reward,
+                "curr_score": curr_score,
+                "final_score": curr_score[0],
+                "ad_id": self.adids[i],
+                "period": self.periods[i],
+            })
 
         self.K = K
-        self.pct_traj = 1.
+        self.pct_traj = 1.0
 
+        # 选择用于训练的轨迹（基于 return 排序）
         num_timesteps = sum(self.traj_lens)
         num_timesteps = max(int(self.pct_traj * num_timesteps), 1)
-        sorted_inds = np.argsort(self.returns)  # lowest to highest for training
+        sorted_inds = np.argsort(self.returns)  # 升序
 
         num_trajectories = 1
         timesteps = self.traj_lens[sorted_inds[-1]]
@@ -130,29 +196,25 @@ class EpisodeReplayBuffer(Dataset):
 
         self.p_sample = self.traj_lens[self.sorted_inds] / sum(self.traj_lens[self.sorted_inds])
 
-    def __getitem__(self, index, if_test=False):
-        if if_test:
-            return 0
+    def __len__(self):
+        return len(self.sorted_inds)
 
+    def __getitem__(self, index):
         traj = self.trajectories[int(self.sorted_inds[index])]
-        start_t = random.randint(0, max(traj['rewards'].shape[0] -self.K, 0))
+        start_t = np.random.randint(0, max(traj['rewards'].shape[0] - self.K, 1))
 
         s = traj['observations'][start_t: start_t + self.K]
         a = traj['actions'][start_t: start_t + self.K]
         r = traj['rewards'][start_t: start_t + self.K].reshape(-1, 1)
         sn = traj['next_states'][start_t: start_t + self.K]
-        all_reward = traj['all_reward'][start_t: start_t + self.K+1].reshape(-1, 1)
-        # curr_score[t] is the return-to-go at state t, so we need K+1 of them
-        # to align with K states/actions in Decision Transformer.
-        curr_score = traj['curr_score'][start_t: start_t + self.K+1].reshape(-1, 1)
-        if 'terminals' in traj:
-            d = traj['terminals'][start_t: start_t + self.K]
-        else:
-            d = traj['dones'][start_t: start_t + self.K]
+        all_reward = traj['all_reward'][start_t: start_t + self.K + 1].reshape(-1, 1)
+        curr_score = traj['curr_score'][start_t: start_t + self.K + 1].reshape(-1, 1)
+        d = traj['dones'][start_t: start_t + self.K]
         timesteps = np.arange(start_t, start_t + s.shape[0])
 
         tlen = s.shape[0]
 
+        # 填充到 K 长度
         s = np.concatenate([np.zeros((self.K - tlen, self.state_dim)), s], axis=0)
         a = np.concatenate([np.ones((self.K - tlen, self.act_dim)) * -10., a], axis=0)
         r = np.concatenate([np.zeros((self.K - tlen, 1)), r], axis=0)
@@ -161,13 +223,16 @@ class EpisodeReplayBuffer(Dataset):
         all_reward = np.concatenate([np.zeros((self.K - tlen, 1)), all_reward], axis=0)
         curr_score = np.concatenate([np.zeros((self.K - tlen, 1)), curr_score], axis=0)
         timesteps = np.concatenate([np.zeros((self.K - tlen)), timesteps], axis=0)
-        mask = np.concatenate([np.zeros((self.K - tlen)), np.ones((tlen))], axis=0)
+        mask = np.concatenate([np.zeros((self.K - tlen)), np.ones(tlen)], axis=0)
+
+        # 归一化
         s = (s - self.state_mean) / self.state_std
         r = r / self.scale
         sn = (sn - self.state_mean) / self.state_std
         all_reward = all_reward / self.scale
         curr_score = curr_score / self.scale
 
+        # 转为 Tensor
         s = torch.from_numpy(s).to(dtype=torch.float32, device=self.device)
         a = torch.from_numpy(a).to(dtype=torch.float32, device=self.device)
         r = torch.from_numpy(r).to(dtype=torch.float32, device=self.device)
@@ -177,6 +242,7 @@ class EpisodeReplayBuffer(Dataset):
         curr_score = torch.from_numpy(curr_score).to(dtype=torch.float32, device=self.device)
         timesteps = torch.from_numpy(timesteps).to(dtype=torch.long, device=self.device)
         mask = torch.from_numpy(mask).to(device=self.device)
+
         return s, a, r, d, all_reward, curr_score, timesteps, mask, sn
 
     def discount_cumsum(self, x, gamma=1.):
@@ -185,73 +251,59 @@ class EpisodeReplayBuffer(Dataset):
         for t in reversed(range(x.shape[0] - 1)):
             discount_cumsum[t] = x[t] + gamma * discount_cumsum[t + 1]
         return discount_cumsum
+
+
 class ValidationDataset(Dataset):
     """
-    验证数据集 - 严格对齐 EpisodeReplayBuffer 的处理逻辑
-    关键修复：
-      1. 使用训练集的 state_mean/std 归一化
-      2. 正确计算 all_reward 和 curr_score（与训练集完全一致）
-      3. 复现 next_state 的特殊处理（done 时用倒数第二状态）
-      4. 保持相同的填充规则和掩码逻辑
+    验证数据集，使用训练集的归一化参数，严格对齐 EpisodeReplayBuffer 的处理逻辑。
     """
-    def __init__(self, 
-                 device, 
-                 state_dim, 
-                 data_path, 
-                 n_ctx=20, 
-                 scale=2000,
-                 state_mean=None, 
-                 state_std=None):
+    def __init__(self, device, state_dim, data_path, n_ctx=20, scale=2000,
+                 state_mean=None, state_std=None):
         self.device = device
         self.state_dim = state_dim
         self.n_ctx = n_ctx
         self.scale = scale
-        
-        # 强制要求传入训练集归一化参数
+
         if state_mean is None or state_std is None:
             raise ValueError(
-                "ValidationDataset 必须传入训练集的 state_mean 和 state_std！\n"
-                "请从 EpisodeReplayBuffer 获取: replay_buffer.state_mean/std"
+                "ValidationDataset 必须传入训练集的 state_mean 和 state_std！"
             )
         self.state_mean = state_mean
         self.state_std = state_std
-        
-        # 加载CSV
-        self.df = pd.read_csv(data_path)
-        
-        # 按轨迹分组（按 deliveryPeriodIndex + advertiserNumber）
+
+        df = pd.read_csv(data_path)
+
+        # 按轨迹分组
         self.trajectories = []
-        grouped = self.df.groupby(['deliveryPeriodIndex', 'advertiserNumber'])
-        
+        grouped = df.groupby(['deliveryPeriodIndex', 'advertiserNumber'])
+
         for (period_idx, adgroup_id), group in grouped:
             group = group.sort_values('timeStepIndex').reset_index(drop=True)
-            
-            # 解析状态
+
+            # 解析状态（使用快速解析函数）
             states = []
             for state_str in group['state']:
-                state = self._parse_state(state_str)
-                states.append(state)
-            
-            # 解析 next_state（处理 None 值）
+                states.append(self._parse_state_fast(state_str))
+
+            # 解析 next_state
             next_states = []
             for ns_str in group['next_state']:
                 if pd.isna(ns_str) or ns_str == '' or ns_str == 'None':
                     next_states.append(None)
                 else:
-                    next_states.append(self._parse_state(ns_str))
-            
-            # 特殊处理：最后一个 next_state 为 None 时，用倒数第二个状态代替（与训练集一致）
+                    next_states.append(self._parse_state_fast(ns_str))
+
+            # 处理最后一个 next_state
             if len(next_states) > 0 and next_states[-1] is None:
                 if len(next_states) >= 2:
                     next_states[-1] = next_states[-2].copy()
                 else:
                     next_states[-1] = np.zeros(self.state_dim, dtype=np.float32)
-            
-            # 构建轨迹
+
             traj_length = len(states)
-            if traj_length < 2:  # 至少需要2步（避免除零错误）
+            if traj_length < 2:
                 continue
-                
+
             traj = {
                 'states': np.array(states, dtype=np.float32),
                 'actions': group['action'].values.astype(np.float32),
@@ -268,143 +320,121 @@ class ValidationDataset(Dataset):
                     'realAllConversion': float(group['realAllConversion'].iloc[0]),
                 }
             }
-            
-            # 计算 all_reward 和 curr_score（与训练集完全一致）
+
+            # 计算 all_reward 和 curr_score
             traj = self._compute_trajectory_scores(traj)
             self.trajectories.append(traj)
-        
-        print(f"✅ 验证集加载完成: {len(self.trajectories)} 条轨迹 | "
-              f"归一化参数来源: 训练集统计量")
-    
-    def _parse_state(self, state_str):
-        """安全解析状态字符串"""
+
+        print(f"✅ 验证集加载完成: {len(self.trajectories)} 条轨迹")
+
+    def _parse_state_fast(self, state_str):
+        """快速解析状态字符串（不使用 literal_eval）"""
         if pd.isna(state_str) or state_str == '' or state_str == 'None':
             return np.zeros(self.state_dim, dtype=np.float32)
-        
+
+        # 去除括号，按逗号分割
+        state_str = state_str.strip()
+        if state_str.startswith('(') and state_str.endswith(')'):
+            state_str = state_str[1:-1]
+        elif state_str.startswith('[') and state_str.endswith(']'):
+            state_str = state_str[1:-1]
+
+        parts = state_str.split(',')
+        if len(parts) != self.state_dim:
+            return np.zeros(self.state_dim, dtype=np.float32)
+
         try:
-            if isinstance(state_str, str):
-                # 处理括号 (1.0, 2.0, ...) 或 [1.0, 2.0, ...]
-                state_str = state_str.strip().replace('(', '[').replace(')', ']')
-                values = ast.literal_eval(state_str)
-                if isinstance(values, (list, tuple)) and len(values) == self.state_dim:
-                    return np.array(values, dtype=np.float32)
-            elif isinstance(state_str, np.ndarray):
-                return state_str.astype(np.float32)
-        except Exception as e:
-            warnings.warn(f"状态解析失败: {state_str} | 错误: {e}")
-        
-        return np.zeros(self.state_dim, dtype=np.float32)
-    
+            values = [float(p.strip()) for p in parts]
+            return np.array(values, dtype=np.float32)
+        except:
+            return np.zeros(self.state_dim, dtype=np.float32)
+
     def _compute_trajectory_scores(self, traj):
-        """
-        复现 EpisodeReplayBuffer 中的分数计算逻辑
-        返回: 增强后的轨迹字典（含 all_reward, curr_score, final_score）
-        """
+        """计算轨迹的 all_reward 和 curr_score"""
         rewards = traj['rewards']
         budget = traj['metadata']['budget']
         cpa_cons = traj['metadata']['CPAConstraint']
         states = traj['states']
         next_states = traj['next_states']
-        
-        # 1. 计算 all_reward: [0, r0, r0+r1, ..., sum(rewards)]
+
         all_reward = np.zeros(len(rewards) + 1)
         for i in range(1, len(all_reward)):
             all_reward[i] = all_reward[i-1] + rewards[i-1]
-        
-        # 2. 构造 s_rtg: states + last next_state (长度 = len(states) + 1)
+
         s_rtg = np.concatenate([states, next_states[-1].reshape(1, -1)], axis=0)
-        
-        # 3. 计算 curr_score (基于预算/CPA约束的动态分数)
         curr_score = getScore(budget, cpa_cons, s_rtg, all_reward)
-        
-        # 4. 转换为 return-to-go: final_score - score_if_stop_at_t
         curr_score = curr_score[-1] - curr_score
-        
-        # 5. 添加到轨迹
-        traj['all_reward'] = all_reward.reshape(-1, 1)  # 形状: (T+1, 1)
-        traj['curr_score'] = curr_score.reshape(-1, 1)  # 形状: (T+1, 1)
+
+        traj['all_reward'] = all_reward.reshape(-1, 1)
+        traj['curr_score'] = curr_score.reshape(-1, 1)
         traj['final_score'] = float(curr_score[0])
-        
         return traj
-    
+
     def __len__(self):
         return len(self.trajectories)
-    
+
     def __getitem__(self, idx):
-        """
-        返回单条轨迹的验证样本（从轨迹开头开始，固定窗口）
-        输出格式与 EpisodeReplayBuffer.__getitem__ 完全一致:
-          (states, actions, rewards, dones, all_reward, curr_score, timesteps, mask, next_states)
-        """
         traj = self.trajectories[idx]
         traj_len = traj['length']
         K = self.n_ctx
-        
-        # 固定从轨迹开头采样（验证集标准做法）
+
+        # 固定从开头采样
         start_t = 0
-        actual_len = min(traj_len, K)  # 实际有效长度
-        
-        # 计算需要填充的长度（前面填充）
+        actual_len = min(traj_len, K)
         pad_len = K - actual_len
-        
-        # ========== 提取原始数据 ==========
-        # 状态/动作/奖励/终止信号（长度 = actual_len）
+
         s = traj['states'][start_t:start_t + actual_len]
         a = traj['actions'][start_t:start_t + actual_len]
         r = traj['rewards'][start_t:start_t + actual_len]
         d = traj['dones'][start_t:start_t + actual_len]
         sn = traj['next_states'][start_t:start_t + actual_len]
-        
-        # all_reward 和 curr_score 长度 = actual_len + 1（需要 K+1 个）
+
         all_r = traj['all_reward'][start_t:start_t + actual_len + 1].flatten()
         curr_s = traj['curr_score'][start_t:start_t + actual_len + 1].flatten()
-        
-        # 时间步
+
         timesteps = np.arange(start_t, start_t + actual_len)
-        
-        # ========== 填充到 K 长度（前面填充）==========
-        # 状态: 前面填充0向量
+
+        # 前面填充
         if pad_len > 0:
             s = np.concatenate([np.zeros((pad_len, self.state_dim)), s], axis=0)
             sn = np.concatenate([np.zeros((pad_len, self.state_dim)), sn], axis=0)
-            a = np.concatenate([np.ones(pad_len) * -10.0, a], axis=0)  # 动作用-10填充
+            a = np.concatenate([np.ones(pad_len) * -10.0, a], axis=0)
             r = np.concatenate([np.zeros(pad_len), r], axis=0)
-            d = np.concatenate([np.ones(pad_len) * 2, d], axis=0)  # done用2填充（表示padding）
+            d = np.concatenate([np.ones(pad_len) * 2, d], axis=0)
             timesteps = np.concatenate([np.zeros(pad_len), timesteps], axis=0)
-        
-        # all_reward/curr_score 填充到 K+1 长度
+
         if pad_len > 0:
             all_r = np.concatenate([np.zeros(pad_len), all_r], axis=0)
             curr_s = np.concatenate([np.zeros(pad_len), curr_s], axis=0)
+
         # 确保长度为 K+1
         if len(all_r) < K + 1:
             all_r = np.concatenate([all_r, np.zeros(K + 1 - len(all_r))], axis=0)
             curr_s = np.concatenate([curr_s, np.zeros(K + 1 - len(curr_s))], axis=0)
         all_r = all_r[:K + 1]
         curr_s = curr_s[:K + 1]
-        
-        # 掩码: 前面 pad_len 个为0，后面 actual_len 个为1
+
         mask = np.zeros(K)
         mask[pad_len:] = 1.0
-        
-        # ========== 归一化（使用训练集统计量）==========
+
+        # 归一化
         s = (s - self.state_mean) / self.state_std
         sn = (sn - self.state_mean) / self.state_std
         r = r / self.scale
         all_r = all_r / self.scale
         curr_s = curr_s / self.scale
-        
-        # ========== 转换为 Tensor ==========
+
+        # 转 Tensor
         s = torch.from_numpy(s).float()
-        a = torch.from_numpy(a).float().unsqueeze(-1)  # (K, 1)
-        r = torch.from_numpy(r).float().unsqueeze(-1)  # (K, 1)
+        a = torch.from_numpy(a).float().unsqueeze(-1)
+        r = torch.from_numpy(r).float().unsqueeze(-1)
         d = torch.from_numpy(d).long()
         sn = torch.from_numpy(sn).float()
-        all_r = torch.from_numpy(all_r).float().unsqueeze(-1)  # (K+1, 1)
-        curr_s = torch.from_numpy(curr_s).float().unsqueeze(-1)  # (K+1, 1)
+        all_r = torch.from_numpy(all_r).float().unsqueeze(-1)
+        curr_s = torch.from_numpy(curr_s).float().unsqueeze(-1)
         timesteps = torch.from_numpy(timesteps).long()
         mask = torch.from_numpy(mask).float()
-        
+
         return s, a, r, d, all_r, curr_s, timesteps, mask, sn
 
 # ==================== 调试用例 ====================
