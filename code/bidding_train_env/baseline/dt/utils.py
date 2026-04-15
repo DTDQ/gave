@@ -7,13 +7,16 @@ import os
 
 
 def getScore(budget, cpa_cons, states, all_reward):
-    beta = 2
+    gamma = 4
     curr_cost = budget * (1 - states[:, 1]).reshape(-1, 1)
     curr_all_reward = all_reward.reshape(-1, 1)
     curr_cpa = curr_cost / (curr_all_reward + 1e-10)
     curr_coef = cpa_cons / (curr_cpa + 1e-10)
-    curr_penalty = pow(curr_coef, beta)
-    curr_penalty = np.where(curr_penalty > 1.0, 1.0, curr_coef)
+    curr_penalty = np.where(
+        curr_cpa <= cpa_cons,
+        1.0,
+        np.power(curr_coef, gamma)
+    )
     curr_score = curr_penalty * curr_all_reward
     return curr_score
 
